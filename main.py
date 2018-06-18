@@ -8,13 +8,29 @@ import os
 import sys
 import typing
 import click
+import traceback
+from textwrap import dedent
 
 
 class Request(typing.NamedTuple):
     verb: str
     resource: str
     version: str
-    headers: typing.Mapping[str, str]
+    headers: typing.Mapping[str, str] = None
+
+
+class Response(typing.NamedTuple):
+    status_code: str
+    body: typing.List[str] = ''
+    headers: typing.Mapping[str, str] = None
+
+
+class HTTPError(Exception):
+    pass
+
+
+class BadRequest(HTTPError):
+    status_code = '400 Bad Request'
 
 
 CRLF = b'\r\n'
@@ -22,61 +38,67 @@ DOUBLE_CRLF = CRLF + CRLF
 
 
 def split_request(socket):
-    buff = []
+    print('We got a request!!')
+    buff = b''
 
     while True:
-        chunk = socket.recv(1024)
+        buff += socket.recv(1024)
 
-        head, success, tail = chunk.partition(DOUBLE_CRLF)
-
-        buff.append(head)
+        head, success, tail = buff.partition(DOUBLE_CRLF)
 
         if success:
-            return b''.join(buff), tail
+            return buff, tail
 
 
 def parse_headers(raw_headers: bytes):
     request_line, *header_lines = raw_headers.decode('ascii').split(CRLF.decode('ascii'))
 
-    verb, resource, version = (it.strip().upper() for it in request_line.split(' '))
+    verb, resource, version = (it.strip() for it in request_line.split(' '))
 
     pairs = [x.partition(':') for x in header_lines]
     headers = {key.strip(): value.strip() for (key, _, value) in pairs}
 
-    return verb, resource, version, headers
+    return verb.upper(), resource, version.upper(), headers
 
 
 def parse_request(client_socket: soc.socket):
-    raw_headers, body_head = split_request(client_socket)
 
-    # Ignore the body
-    return Request._make(parse_headers(raw_headers))
+    try:
+        raw_headers, body_head = split_request(client_socket)
+
+        # Ignore the body for the moment
+        return Request._make(parse_headers(raw_headers))
+
+    except Exception:
+        print('Ouch, bad request')
+        traceback.print_exc()
+
+        raise BadRequest
+
+
+def get_response(req: Request):
+    return Response(
+        status_code='200 OK',
+        body=[
+            f'You made a {req.verb} {req.version} request on the resource {req.resource}.',
+            f'Parsed headers: {req.headers}',
+        ]
+    )
 
 
 def handle_request(client_socket):
-    print('WOOOOOOWWW we\'ve got a request!!!')
-    request = parse_request(client_socket)
-    print(request)
 
-    # chunk = client_socket.recv(1024)
-    # raw_headers, _, body = chunk.partition(b'\r\n\r\n')
-    # request_line, *header_pairs = raw_headers.decode('ascii').splitlines()
-    # method, resource, http_version = request_line.split(' ')
-    #
-    # headers = {}
-    #
-    # for header_pair in header_pairs:
-    #     key, _, value = header_pair.partition(':')
-    #     headers[key.strip()] = value.strip()
-    #
-    # response = dedent(f'''\
-    #     HTTP/1.1 200 OK
-    #
-    #     You made a {method} {http_version} request on the resource {resource}.
-    #     Parsed headers: {headers}
-    # ''').encode('utf-8')
-    #
-    # client_socket.sendall(response)
+    try:
+        req = parse_request(client_socket)
+        resp = get_response(req)
+
+    except BadRequest as exc:
+        resp = Response(status_code=exc.status_code)
+
+    lines = ['HTTP/1.1 {resp.status_code}', ''] + resp.body + ['']
+    raw_response = CRLF.join([l.encode('utf-8') for l in lines])
+
+    client_socket.sendall(raw_response)
 
 
 @click.command()
