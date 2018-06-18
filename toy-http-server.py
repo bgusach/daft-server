@@ -9,7 +9,19 @@ import sys
 import typing
 import click
 import traceback
-from textwrap import dedent
+import signal
+import errno
+
+
+def on_child_signal(signum, frame):
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except OSError:
+            return
+
+        if pid == 0:
+            return
 
 
 class Request(typing.NamedTuple):
@@ -21,7 +33,7 @@ class Request(typing.NamedTuple):
 
 class Response(typing.NamedTuple):
     status_code: str
-    body: typing.List[str] = ''
+    body: typing.List[str] = ()
     headers: typing.Mapping[str, str] = None
 
 
@@ -77,13 +89,16 @@ def parse_request(client_socket: soc.socket):
 
 
 def get_response(req: Request):
-    return Response(
-        status_code='200 OK',
-        body=[
-            f'You made a {req.verb} {req.version} request on the resource {req.resource}.',
-            f'Parsed headers: {req.headers}',
-        ]
-    )
+    if req.verb == 'GET':
+        return Response(
+            status_code='200 OK',
+            body=[
+                f'You made a {req.verb} {req.version} request on the resource {req.resource}.',
+                f'Parsed headers: {req.headers}',
+            ]
+        )
+
+    return Response(status_code='405 Method Not Allowed')
 
 
 def handle_request(client_socket):
@@ -95,7 +110,10 @@ def handle_request(client_socket):
     except BadRequest as exc:
         resp = Response(status_code=exc.status_code)
 
-    lines = ['HTTP/1.1 {resp.status_code}', ''] + resp.body + ['']
+    lines = [f'HTTP/1.1 {resp.status_code}', '']
+    lines.extend(resp.body)
+    lines.append('')
+
     raw_response = CRLF.join([l.encode('utf-8') for l in lines])
 
     client_socket.sendall(raw_response)
@@ -115,8 +133,19 @@ def serve(host, port, queue_size, delay):
 
         print('Serving on %s' % port)
 
+        signal.signal(signal.SIGCHLD, on_child_signal)
+
         while True:
-            client_socket, client_address = socket_server.accept()
+
+            try:
+                client_socket, client_address = socket_server.accept()
+
+            except IOError as exc:
+                # This will be triggered if a SIGCHLD comes while waiting
+                if exc.errno == errno.EINTR:
+                    continue
+
+                raise
 
             pid = os.fork()
 
