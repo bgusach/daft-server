@@ -3,7 +3,6 @@
 from __future__ import unicode_literals
 
 
-from operator import itemgetter
 import socket as soc
 import time
 import os
@@ -17,6 +16,7 @@ import io
 import numbers
 
 from tools import Headers
+from tools import import_by_fqpn
 
 from pprint import pprint
 
@@ -36,18 +36,49 @@ def on_child_signal(signum, frame):
             return
 
 
+class BodyBuffer(object):
+
+    def __init__(self, preallocated, socket, content_length, buffer_size=4096):
+        self._buffered = preallocated
+        self._socket = socket
+        self._bytes_left = content_length - len(preallocated)
+        self._buffer_size = buffer_size
+
+    def read(self, size) -> bytes:
+
+        while len(self._buffered) < size:
+            # Avoid reading further than content length
+            bytes_to_read = min(self._buffer_size, self._bytes_left)
+
+            new_data = self._socket.read(bytes_to_read)
+
+            if not new_data:
+                break
+
+            self._buffered += new_data
+            self._bytes_left -= len(new_data)
+
+        result = self._buffered[:size]
+        self._buffered = self._buffered[size:]
+
+        return result
+
+    def readline(self):
+        pass
+
+    def readlines(self, hint):
+        pass
+
+    def __iter__(self):
+        pass
+
+
 class Request(typing.NamedTuple):
-    verb: bytes
-    resource: bytes
-    version: bytes
-    headers: typing.Mapping[bytes, bytes]
-    body: bytes
-
-
-class Response(typing.NamedTuple):
-    status_code: str
-    body: typing.List[str] = ()
-    headers: typing.Mapping[str, str] = None
+    verb: str
+    resource: str
+    version: str
+    headers: Headers
+    body: BodyBuffer
 
 
 class HTTPError(Exception):
@@ -109,14 +140,14 @@ class DaftServer(object):
 
         try:
             req = self._parse_request(client_socket)
-            status, headers, body_lines = self._get_response(req)
+            status, headers, response_lines = self._get_response(req)
 
-        except BadRequest as exc:
+        except BadRequest:
             status = b'400 Bad Request'
 
             # TODO: extend headers
             headers = Headers()
-            body_lines = []
+            response_lines = []
 
         # From WSGI specification: response headers must not be sent until there
         # is actual body data available, or until the application's returned
@@ -125,86 +156,55 @@ class DaftServer(object):
         # TODO: handle all necessary headers (content-length & friends)
         headers_sent = False
 
-        for line in body_lines:
-            if line and not headers_sent:
-                # Send headers
-                client_socket.send(b' '.join([b'HTTP/1.1', status, CRLF]))
+        for line in response_lines:
 
-                log('Sending headers:')
-                for header_line in headers.get_formatted_lines():
-                    client_socket.send(header_line + CRLF)
-                    log(header_line)
+            if line and not headers_sent:
+                log('Sending start line and headers')
+                client_socket.send(b' '.join([b'HTTP/1.1', status.encode('ascii'), CRLF]))
+
+                for header_line in headers.to_lines():
+                    client_socket.send(header_line.encode('ascii') + CRLF)
 
                 client_socket.send(CRLF)
                 headers_sent = True
 
-            client_socket.send(line + CRLF)
+            client_socket.send(line)
 
     def _parse_request(self, client_socket: soc.socket):
+        buff = b''
 
-        try:
-            start_line, raw_headers, body_head = self._split_request(client_socket)
-            verb, resource, version = self._parse_start_line(start_line)
-            headers = self._parse_headers(raw_headers)
-            log(headers)
+        while True:
+            new_data = client_socket.recv(4096)
 
-            # Easy hack: push everything in memory. Should actually use a buffer
-            content_len = int(headers.get('Content-Length', 0))
-            body = body_head + client_socket.recv(content_len - len(body_head))
+            if not new_data:
+                # Somebody hung up on us :(
+                raise BadRequest
 
-            return Request(
-                verb,
-                resource,
-                version,
-                headers,
-                body,
-            )
+            buff += new_data
 
-        except Exception:
-            log('Ouch, bad request')
-            traceback.print_exc()
+            metadata, succ, body = buff.partition(DOUBLE_CRLF)
 
-            raise BadRequest
+            if succ:
+               break
+
+        start_line, *header_lines = metadata.decode('ascii').split('\r\n')
+        verb, resource, version = self._parse_start_line(start_line)
+        headers = Headers.from_lines(header_lines)
+
+        contents_length = int(headers.get('content-length', 0))
+
+        return Request(
+            verb,
+            resource,
+            version,
+            headers,
+            BodyBuffer(body, client_socket, contents_length)
+        )
 
     @staticmethod
     def _parse_start_line(line):
-        verb, resource, version = (it.strip() for it in line.split(b' '))
+        verb, resource, version = (it.strip() for it in line.split(' '))
         return verb.upper(), resource, version.upper()
-
-    @staticmethod
-    def _split_request(socket: soc.socket):
-        """
-        Returns a tuple (start line, raw headers, head of body)
-        """
-        pprint('We got a request!!')
-        buff = b''
-
-        # Get start line
-        while True:
-            buff += socket.recv(1024)
-            head, success, tail = buff.partition(CRLF)
-
-            if success:
-                start_line = head
-                buff = tail
-                break
-
-        # Split headers and body
-        while True:
-            head, success, tail = buff.partition(DOUBLE_CRLF)
-
-            if success:
-                return start_line, buff, tail
-
-            buff += socket.recv(1024)
-
-    @staticmethod
-    def _parse_headers(raw_headers: bytes):
-        header_lines = raw_headers.split(CRLF)
-
-        get_key_and_value = itemgetter(0, 2)
-        pairs = [get_key_and_value(x.partition(b':')) for x in header_lines]
-        return Headers(pairs)
 
     def _get_response(self, req: Request):
 
@@ -213,43 +213,85 @@ class DaftServer(object):
 
         def start_response(status, response_headers, exc_info=None):
             nonlocal returned_status
-            # TODO: think of a reasonable encoding approach
-            returned_status = to_bytes(status)
+            returned_status = status
 
             nonlocal returned_headers
-            log(response_headers)
-            returned_headers = [(to_bytes(k), to_bytes(v)) for k, v in response_headers]
-            log(returned_headers)
+            returned_headers = response_headers
 
             def write(data):
                 raise Exception('Sorry mate, we don\'t support the imperative write API')
 
             return write
 
-        body_lines = self._app(
-            {
-                'wsgi.version': (1, 0),
-                'wsgi.url_scheme': 'http',
-                'wsgi.input': io.BytesIO(req.body),
-                'wsgi.errors': sys.stderr,
-                'wsgi.multithread': False,
-                'wsgi.multiprocess': True,
-                'wsgi.run_once': False,
-                'REQUEST_METHOD': req.verb,
-                'SCRIPT_NAME': '',
-                'PATH_INFO': req.resource,
-                'CONTENT_TYPE': req.headers.get(b'Content-Type', ''),
-                'CONTENT_LENGTH': req.headers.get(b'Content-Length', ''),
-                'SERVER_NAME': self._host,
-                'SERVER_PORT': str(self._port),
-            },
-            start_response,
-        )
+        try:
+            body_lines = self._app(self._get_env_for_request(req), start_response)
+        except Exception as exc:
+            log('Error from app')
+            import traceback
+            traceback.print_exc()
+            returned_status = '500 Server Error'
+            # TODO: write proper headers
+            returned_headers = []
+            body_lines = []
 
-        if not returned_status or not returned_headers:
+        if not returned_status or returned_headers is None:
             raise Exception('App did not provide status or headers')
 
         return returned_status, Headers(returned_headers), body_lines
+
+    def _get_env_for_request(self, req):
+        return {
+            'wsgi.version': (1, 0),
+            'wsgi.url_scheme': 'http',
+            'wsgi.input': req.body,
+            'wsgi.errors': sys.stderr,
+            'wsgi.multithread': False,
+            'wsgi.multiprocess': True,
+            'wsgi.run_once': False,
+            'REQUEST_METHOD': req.verb,
+            'SCRIPT_NAME': '',
+            'PATH_INFO': req.resource,
+            'CONTENT_TYPE': req.headers.get('Content-Type'),
+            'CONTENT_LENGTH': int(req.headers.get('Content-Length', 0)),
+            'SERVER_NAME': self._host,
+            'SERVER_PORT': self._port,
+        }
+
+
+class RequestHandler(object):
+
+    def __init__(self, send, recv):
+        # self._socket = socket
+        self._send = send
+        self._recv = recv
+        self.status = None
+        self._headers = None
+        self._start_response_called = False
+        self._headers_sent = False
+
+    def run(self):
+        pass
+
+    def start_response(self, status, response_headers, exc_info=None):
+        self.status = status
+        self._headers = Headers(response_headers)
+
+        self._start_response_called = True
+        return self.write
+
+    def _send_headers(self):
+        if self._headers_sent:
+            raise Exception('Headers were already sent!')
+
+        self._send(b' '.join([b'HTTP/1.1', self.status, CRLF]))
+
+        for line in self._headers.get_formatted_lines():
+            self._send(line + CRLF)
+
+        self._headers_sent = True
+
+    def write(self, data):
+        raise Exception('Sorry mate, we don\'t support the imperative write API')
 
 
 def to_bytes(val):
@@ -260,19 +302,6 @@ def to_bytes(val):
         return str(val).encode('ascii')
 
     return bytes(val)  # And hope for the best
-
-
-def wsgi_app(env, start_response):
-    print('WSGI APP CALLED!!')
-    print(env)
-    response = [b'heeeeey', b'amigooo']
-
-    # TODO: fix the content-length. it should be based on bytes and not unicode strings
-    start_response(
-        '200 OK',
-        [('Content-Type', 'text/html'), ('Content-Length', sum(map(len, response)))]
-    )
-    return response
 
 
 @click.command()
@@ -286,15 +315,8 @@ def serve(wsgi_callable, host, port, queue_size, delay):
     WSGI_CALLABLE: WSGI App in form module.path:callable
 
     """
-    mod, _, callable = wsgi_callable.partition(':')
-
-    if not mod or not callable:
-        raise Exception('Could not parse path to WSGI app')
-
-    app = getattr(__import__(mod), callable)
-
+    app = import_by_fqpn(wsgi_callable)
     server = DaftServer(host, port, queue_size, app, delay)
-
     server.serve()
 
 
