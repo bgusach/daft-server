@@ -9,11 +9,11 @@ import os
 import sys
 import typing
 import click
-import traceback
 import signal
 import errno
 import io
 import numbers
+import traceback
 
 from tools import Headers
 from tools import import_by_fqpn
@@ -38,17 +38,22 @@ def on_child_signal(signum, frame):
 
 class BodyBuffer(object):
 
-    def __init__(self, preallocated, socket, content_length, buffer_size=4096):
+    def __init__(
+        self,
+        preallocated: bytes,
+        socket: soc.socket,
+        content_length: int,
+        buffer_size=4096
+    ):
         self._buffered = preallocated
         self._socket = socket
-        self._bytes_left = content_length - len(preallocated)
+        self._socket_bytes_left_to_content_length = content_length - len(preallocated)
         self._buffer_size = buffer_size
 
     def read(self, size) -> bytes:
-
         while len(self._buffered) < size:
             # Avoid reading further than content length
-            bytes_to_read = min(self._buffer_size, self._bytes_left)
+            bytes_to_read = min(self._buffer_size, self._socket_bytes_left_to_content_length)
 
             new_data = self._socket.read(bytes_to_read)
 
@@ -56,15 +61,19 @@ class BodyBuffer(object):
                 break
 
             self._buffered += new_data
-            self._bytes_left -= len(new_data)
+            self._socket_bytes_left_to_content_length -= len(new_data)
 
         result = self._buffered[:size]
         self._buffered = self._buffered[size:]
 
         return result
 
-    def readline(self):
-        pass
+    def readline(self) -> bytes:
+        while True:
+            line, succ, rest = self._buffered.partition(CRLF)
+
+            if succ:
+                self._buffered = rest
 
     def readlines(self, hint):
         pass
@@ -182,7 +191,7 @@ class DaftServer(object):
 
             buff += new_data
 
-            metadata, succ, body = buff.partition(DOUBLE_CRLF)
+            metadata, succ, body_start = buff.partition(DOUBLE_CRLF)
 
             if succ:
                break
@@ -198,7 +207,7 @@ class DaftServer(object):
             resource,
             version,
             headers,
-            BodyBuffer(body, client_socket, contents_length)
+            BodyBuffer(body_start, client_socket, contents_length)
         )
 
     @staticmethod
@@ -227,8 +236,7 @@ class DaftServer(object):
             body_lines = self._app(self._get_env_for_request(req), start_response)
         except Exception as exc:
             log('Error from app')
-            import traceback
-            traceback.print_exc()
+            log(traceback.format_exc())
             returned_status = '500 Server Error'
             # TODO: write proper headers
             returned_headers = []
@@ -292,16 +300,6 @@ class RequestHandler(object):
 
     def write(self, data):
         raise Exception('Sorry mate, we don\'t support the imperative write API')
-
-
-def to_bytes(val):
-    if isinstance(val, str):
-        return val.encode('ascii')
-
-    if isinstance(val, numbers.Number):
-        return str(val).encode('ascii')
-
-    return bytes(val)  # And hope for the best
 
 
 @click.command()
