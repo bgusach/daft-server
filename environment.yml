@@ -1,0 +1,9 @@
+name: goattp
+
+dependencies:
+  - python=3.7
+  - pytest
+  - pip
+  - pip:
+    - '--editable=.'
+

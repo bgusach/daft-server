@@ -43,30 +43,40 @@ class BodyBuffer(object):
         preallocated: bytes,
         socket: soc.socket,
         content_length: int,
-        buffer_size=4096
+        buffer_size: int=4096,
     ):
         self._buffered = preallocated
         self._socket = socket
-        self._socket_bytes_left_to_content_length = content_length - len(preallocated)
+        self._socket_bytes_left = content_length - len(preallocated)
         self._buffer_size = buffer_size
 
     def read(self, size) -> bytes:
-        while len(self._buffered) < size:
-            # Avoid reading further than content length
-            bytes_to_read = min(self._buffer_size, self._socket_bytes_left_to_content_length)
-
-            new_data = self._socket.read(bytes_to_read)
-
-            if not new_data:
-                break
-
-            self._buffered += new_data
-            self._socket_bytes_left_to_content_length -= len(new_data)
-
+        self._fill_buffer(size)
         result = self._buffered[:size]
         self._buffered = self._buffered[size:]
 
         return result
+
+    def _fill_buffer(self, desired_buffered_size):
+        """
+        Reads from socket into buffer until buffer has at least the desired length
+        or the socket is exhausted.
+
+        :return: True if the desired buffer size was reached, False otherwise
+
+        """
+        while len(self._buffered) < desired_buffered_size:
+            # Avoid reading further than content length
+            max_allowed = min(self._buffer_size, self._socket_bytes_left)
+            new_data = self._socket.read(max_allowed)
+
+            if not new_data:
+                return False
+
+            self._socket_bytes_left -= len(new_data)
+            self._buffered += new_data
+
+        return True
 
     def readline(self) -> bytes:
         while True:
@@ -74,6 +84,13 @@ class BodyBuffer(object):
 
             if succ:
                 self._buffered = rest
+                return line
+
+            # NOTE [bgu 27-08-2018]: this will loop forever on broken connections
+            success = self._fill_buffer(self._buffer_size)
+
+            if not success:
+                return line
 
     def readlines(self, hint):
         pass
@@ -183,7 +200,7 @@ class DaftServer(object):
         buff = b''
 
         while True:
-            new_data = client_socket.recv(4096)
+            new_data = client_socket.recv(512)
 
             if not new_data:
                 # Somebody hung up on us :(
@@ -207,7 +224,7 @@ class DaftServer(object):
             resource,
             version,
             headers,
-            BodyBuffer(body_start, client_socket, contents_length)
+            BodyBuffer(body_start, client_socket, contents_length),
         )
 
     @staticmethod
