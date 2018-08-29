@@ -1,6 +1,8 @@
-ENV_BIN = ./env/bin
+ENV = env
+ENV_DIR = ./$(ENV)
+ENV_BIN = $(ENV_DIR)/bin
 
-.PHONY: clean test make_env
+.PHONY: clean test
 
 clean:
 	rm -rf dist build src/goattp.egg-info __pycache__
@@ -10,8 +12,5 @@ clean:
 test: env
 	$(ENV_BIN)/pytest tests
 
-make_env: env
-
-env: environment.yml
-	conda env create --force --prefix=env
-
+env: environment.yml setup.py
+	conda env create --force --prefix=$(ENV_DIR)
