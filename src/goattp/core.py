@@ -15,8 +15,8 @@ import io
 import numbers
 import traceback
 
-from tools import Headers
-from tools import import_by_fqpn
+from .tools import Headers
+from .tools import import_by_fqpn
 
 from pprint import pprint
 
