@@ -11,14 +11,12 @@ import typing
 import click
 import signal
 import errno
-import io
-import numbers
 import traceback
+
+from goattp.tools import parse_http_socket
 
 from .tools import Headers
 from .tools import import_by_fqpn
-
-from pprint import pprint
 
 
 def log(msg):
@@ -36,77 +34,6 @@ def on_child_signal(signum, frame):
             return
 
 
-class BodyBuffer(object):
-
-    def __init__(
-        self,
-        preallocated: bytes,
-        socket: soc.socket,
-        content_length: int,
-        buffer_size: int=4096,
-    ):
-        self._buffered = preallocated
-        self._socket = socket
-        self._socket_bytes_left = content_length - len(preallocated)
-        self._buffer_size = buffer_size
-
-    def read(self, size) -> bytes:
-        self._fill_buffer(size)
-        result = self._buffered[:size]
-        self._buffered = self._buffered[size:]
-
-        return result
-
-    def _fill_buffer(self, desired_buffered_size):
-        """
-        Reads from socket into buffer until buffer has at least the desired length
-        or the socket is exhausted.
-
-        :return: True if the desired buffer size was reached, False otherwise
-
-        """
-        while len(self._buffered) < desired_buffered_size:
-            # Avoid reading further than content length
-            max_allowed = min(self._buffer_size, self._socket_bytes_left)
-            new_data = self._socket.read(max_allowed)
-
-            if not new_data:
-                return False
-
-            self._socket_bytes_left -= len(new_data)
-            self._buffered += new_data
-
-        return True
-
-    def readline(self) -> bytes:
-        while True:
-            line, succ, rest = self._buffered.partition(CRLF)
-
-            if succ:
-                self._buffered = rest
-                return line
-
-            # NOTE [bgu 27-08-2018]: this will loop forever on broken connections
-            success = self._fill_buffer(self._buffer_size)
-
-            if not success:
-                return line
-
-    def readlines(self, hint):
-        pass
-
-    def __iter__(self):
-        pass
-
-
-class Request(typing.NamedTuple):
-    verb: str
-    resource: str
-    version: str
-    headers: Headers
-    body: BodyBuffer
-
-
 class HTTPError(Exception):
     pass
 
@@ -115,8 +42,6 @@ class BadRequest(HTTPError):
     status_code = '400 Bad Request'
 
 
-CRLF = b'\r\n'
-DOUBLE_CRLF = CRLF + CRLF
 
 
 class DaftServer(object):
@@ -219,18 +144,6 @@ class DaftServer(object):
 
         contents_length = int(headers.get('content-length', 0))
 
-        return Request(
-            verb,
-            resource,
-            version,
-            headers,
-            BodyBuffer(body_start, client_socket, contents_length),
-        )
-
-    @staticmethod
-    def _parse_start_line(line):
-        verb, resource, version = (it.strip() for it in line.split(' '))
-        return verb.upper(), resource, version.upper()
 
     def _get_response(self, req: Request):
 
