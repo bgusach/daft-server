@@ -93,8 +93,16 @@ class BodyBuffer(object):
         self._socket = socket
         self._socket_bytes_left = content_length - len(preallocated)
         self._buffer_size = buffer_size
+        self._socket_exhausted = False
 
-    def read(self, size) -> bytes:
+    def read(self, size: int=None) -> bytes:
+        """
+        Reads `size` bytes. If `size` not provided, all the contents will be delivered.
+
+        """
+        if size is None:
+            size = len(self._buffered) + self._socket_bytes_left
+
         self._fill_buffer(size)
         result = self._buffered[:size]
         self._buffered = self._buffered[size:]
@@ -106,16 +114,16 @@ class BodyBuffer(object):
         Reads from socket into buffer until buffer has at least the desired length
         or the socket is exhausted.
 
-        :return: True if the desired buffer size was reached, False otherwise
 
         """
         while len(self._buffered) < desired_buffered_size:
             # Avoid reading further than content length
             max_allowed = min(self._buffer_size, self._socket_bytes_left)
-            new_data = self._socket.read(max_allowed)
+            new_data = self._socket.recv(max_allowed)
 
             if not new_data:
-                return False
+                self._socket_exhausted = True
+                return
 
             self._socket_bytes_left -= len(new_data)
             self._buffered += new_data
@@ -124,6 +132,7 @@ class BodyBuffer(object):
 
     def readline(self) -> bytes:
         while True:
+
             for line_ending in line_endings:
                 line, succ, rest = self._buffered.partition(line_ending)
 
@@ -131,11 +140,16 @@ class BodyBuffer(object):
                     self._buffered = rest
                     return line + succ
 
+            if self._socket_exhausted:
+                rest = self._buffered
+                self._buffered = b''
+                return rest
+
             # FIXME [bgu 27-08-2018]: this will loop forever on broken connections
             self._fill_buffer(self._buffer_size)
 
     def readlines(self, hint=None):
-        pass
+        return list(iter(self.readline, b''))
 
     def __iter__(self):
         pass

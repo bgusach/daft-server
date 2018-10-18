@@ -1,21 +1,8 @@
 # coding: utf-8
 
-from __future__ import unicode_literals
-
-
 from goattp.tools import BodyBuffer
 
-
-class MockSocket(object):
-
-    def __init__(self, contents):
-        self._contents = contents
-
-    def read(self, len):
-        result = self._contents[:len]
-        self._contents = self._contents[len:]
-
-        return result
+from helpers import MockSocket
 
 
 def test_basic():
@@ -47,8 +34,19 @@ def test_with_content_length():
     b = BodyBuffer(
         preallocated=b'live',
         socket=MockSocket(b' long and prosper'),
-        content_length=8,
+        content_length=9,
     )
 
     assert b.read(500) == b'live long'
     assert b.read(500) == b''
+
+
+def test_read_all():
+    b = BodyBuffer(
+        preallocated=b'live',
+        socket=MockSocket(b' long and prosper'),
+        content_length=9,
+    )
+
+    assert b.read() == b'live long'
+
