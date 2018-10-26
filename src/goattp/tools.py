@@ -2,15 +2,19 @@
 
 from __future__ import unicode_literals
 
-from typing import Tuple
 from typing import NamedTuple
-
+import sys
 import socket as soc
-from collections import defaultdict
+
+from . import ret_codes
 
 CRLF = b'\r\n'
 DOUBLE_CRLF = CRLF * 2
 line_endings = [CRLF, b'\r', b'\n']
+
+
+def log(msg):
+    print('goattp:', msg, file=sys.stderr)
 
 
 class Headers(object):
@@ -169,6 +173,14 @@ def parse_http_socket(soc: soc.socket) -> Request:
     a buffer containing the request body is returned
     
     """
+    try:
+        return _parse_socket(soc)
+
+    except Exception as exc:
+        raise ret_codes.BadRequest from exc
+
+
+def _parse_socket(soc: soc.socket) -> Request:
     buff = b''
 
     while True:

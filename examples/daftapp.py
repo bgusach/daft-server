@@ -31,3 +31,6 @@ def app(env, start_response):
     return [response]
 
 
+if __name__ == '__main__':
+    from goattp.core import serve
+    serve(app)

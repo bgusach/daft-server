@@ -7,20 +7,17 @@ import socket as soc
 import time
 import os
 import sys
-import typing
-import click
 import signal
 import errno
 import traceback
+from itertools import chain
 
 from goattp.tools import parse_http_socket
+from goattp.tools import CRLF
 
 from .tools import Headers
-from .tools import import_by_fqpn
-
-
-def log(msg):
-    print('daft-server:', msg, file=sys.stderr)
+from .tools import log
+from . import ret_codes
 
 
 def on_child_signal(signum, frame):
@@ -34,17 +31,7 @@ def on_child_signal(signum, frame):
             return
 
 
-class HTTPError(Exception):
-    pass
-
-
-class BadRequest(HTTPError):
-    status_code = '400 Bad Request'
-
-
-
-
-class DaftServer(object):
+class GoatTTPSever(object):
 
     def __init__(self, host, port, queue_size, app, delay=0):
         self._host = host
@@ -88,94 +75,69 @@ class DaftServer(object):
                     client_socket.close()
 
     def _handle_request(self, client_socket):
+        metadata_sent = False
+        metadata_set = False
+        status = None
+        headers = None
+
+        def start_response(_status, _headers, exc_info=None):
+            # TODO [bgusach 26.10.2018]: check that no hop-by-hop headers have been sent
+            # or other errors in the headers
+            nonlocal status
+            nonlocal headers
+            nonlocal metadata_set
+
+            if exc_info and metadata_sent:
+                # Well, too late to change your mind!
+                raise exc_info[1].with_traceback(exc_info[2])
+
+            if metadata_set and not exc_info:
+                raise Exception('Status/headers already set!! (and no error provided)')
+
+            status = _status
+            headers = Headers(_headers)
+            metadata_set = True
 
         try:
-            req = self._parse_request(client_socket)
-            status, headers, response_lines = self._get_response(req)
+            req = parse_http_socket(client_socket)
+            body = self._app(self._get_env_for_request(req), start_response)
 
-        except BadRequest:
-            status = b'400 Bad Request'
+            if not metadata_set:
+                raise Exception('App did not set status/headers with `start_response`')
 
-            # TODO: extend headers
+        except ret_codes.BadRequest:
+            status = ret_codes.BadRequest.status_code
             headers = Headers()
-            response_lines = []
+            body = [traceback.format_exc().encode('ascii')]
 
-        # From WSGI specification: response headers must not be sent until there
-        # is actual body data available, or until the application's returned
-        # iterable is exhausted
+        except Exception:
+            status = b'500 Server Error'
+            headers = Headers()
+            body = [traceback.format_exc().encode('ascii')]
 
-        # TODO: handle all necessary headers (content-length & friends)
-        headers_sent = False
+        # TODO [bgusach 26.10.2018]: supply missing headers like date or server
 
-        for line in response_lines:
+        body = iter(body)  # It may not be an iterator
 
-            if line and not headers_sent:
-                log('Sending start line and headers')
-                client_socket.send(b' '.join([b'HTTP/1.1', status.encode('ascii'), CRLF]))
-
-                for header_line in headers.to_lines():
-                    client_socket.send(header_line.encode('ascii') + CRLF)
-
-                client_socket.send(CRLF)
-                headers_sent = True
-
-            client_socket.send(line)
-
-    def _parse_request(self, client_socket: soc.socket):
-        buff = b''
-
-        while True:
-            new_data = client_socket.recv(512)
-
-            if not new_data:
-                # Somebody hung up on us :(
-                raise BadRequest
-
-            buff += new_data
-
-            metadata, succ, body_start = buff.partition(DOUBLE_CRLF)
-
-            if succ:
-               break
-
-        start_line, *header_lines = metadata.decode('ascii').split('\r\n')
-        verb, resource, version = self._parse_start_line(start_line)
-        headers = Headers.from_lines(header_lines)
-
-        contents_length = int(headers.get('content-length', 0))
-
-
-    def _get_response(self, req: Request):
-
-        returned_status = None
-        returned_headers = None
-
-        def start_response(status, response_headers, exc_info=None):
-            nonlocal returned_status
-            returned_status = status
-
-            nonlocal returned_headers
-            returned_headers = response_headers
-
-            def write(data):
-                raise Exception('Sorry mate, we don\'t support the imperative write API')
-
-            return write
-
+        # Delay sending metadata until we get some real data
         try:
-            body_lines = self._app(self._get_env_for_request(req), start_response)
-        except Exception as exc:
-            log('Error from app')
-            log(traceback.format_exc())
-            returned_status = '500 Server Error'
-            # TODO: write proper headers
-            returned_headers = []
-            body_lines = []
+            first_chunk = next(chunk for chunk in body if chunk)
+        except StopIteration:
+            first_chunk = b''
 
-        if not returned_status or returned_headers is None:
-            raise Exception('App did not provide status or headers')
+        log('Sending start line and headers')
+        client_socket.send(f'HTTP/1.1 {status}\r\n'.encode('ascii'))
 
-        return returned_status, Headers(returned_headers), body_lines
+        for header_line in headers.to_lines():
+            client_socket.send(f'{header_line}\r\n'.encode('ascii'))
+
+        client_socket.send(CRLF)
+
+        metadata_sent = True
+
+        for line in chain([first_chunk], body):
+            print(repr(line))
+            client_socket.send(line)
 
     def _get_env_for_request(self, req):
         return {
@@ -194,59 +156,3 @@ class DaftServer(object):
             'SERVER_NAME': self._host,
             'SERVER_PORT': self._port,
         }
-
-
-class RequestHandler(object):
-
-    def __init__(self, send, recv):
-        # self._socket = socket
-        self._send = send
-        self._recv = recv
-        self.status = None
-        self._headers = None
-        self._start_response_called = False
-        self._headers_sent = False
-
-    def run(self):
-        pass
-
-    def start_response(self, status, response_headers, exc_info=None):
-        self.status = status
-        self._headers = Headers(response_headers)
-
-        self._start_response_called = True
-        return self.write
-
-    def _send_headers(self):
-        if self._headers_sent:
-            raise Exception('Headers were already sent!')
-
-        self._send(b' '.join([b'HTTP/1.1', self.status, CRLF]))
-
-        for line in self._headers.get_formatted_lines():
-            self._send(line + CRLF)
-
-        self._headers_sent = True
-
-    def write(self, data):
-        raise Exception('Sorry mate, we don\'t support the imperative write API')
-
-
-@click.command()
-@click.argument('wsgi-callable')
-@click.option('-h', '--host', default='localhost')
-@click.option('-p', '--port', default=8888)
-@click.option('-q', '--queue-size', default=5)
-@click.option('-d', '--delay', default=0)
-def serve(wsgi_callable, host, port, queue_size, delay):
-    """
-    WSGI_CALLABLE: WSGI App in form module.path:callable
-
-    """
-    app = import_by_fqpn(wsgi_callable)
-    server = DaftServer(host, port, queue_size, app, delay)
-    server.serve()
-
-
-if __name__ == '__main__':
-    serve()

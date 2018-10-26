@@ -49,4 +49,3 @@ def test_read_all():
     )
 
     assert b.read() == b'live long'
-
